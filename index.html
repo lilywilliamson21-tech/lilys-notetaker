@@ -192,6 +192,22 @@ input,textarea,select{font-family:var(--ui); color:var(--ink); font-size:14px}
 .reader-head .byline{font-family:var(--mono); font-size:12px; color:var(--ink-soft); display:flex; gap:14px; flex-wrap:wrap}
 .article{font-family:var(--read); font-size:17.5px; line-height:1.78; max-width:70ch}
 .article p{margin-bottom:1.25em}
+.article.pdf-mode{max-width:min(880px,100%); display:flex; flex-direction:column; align-items:center}
+.pdf-loading{font-family:var(--mono); font-size:13px; color:var(--ink-soft); padding:60px 0}
+.pdf-page{
+  position:relative; margin-bottom:22px; background:#fff; border-radius:4px;
+  box-shadow:var(--shadow); overflow:hidden;
+}
+.pdf-page canvas{display:block}
+.textLayer{
+  position:absolute; inset:0; overflow:clip; opacity:1; line-height:1;
+  text-align:initial; transform-origin:0 0;
+}
+.textLayer span, .textLayer br{
+  color:transparent; position:absolute; white-space:pre; cursor:text; transform-origin:0 0;
+}
+.textLayer ::selection{background:rgba(192,132,151,.35)}
+.textLayer mark.hl{background:color-mix(in srgb, var(--hlc) 55%, transparent) !important}
 mark.hl{
   padding:1.5px 1px; border-radius:3px; cursor:pointer; position:relative;
   background:linear-gradient(104deg, transparent 0.5%, var(--hlc) 3%, var(--hlc) 97%, transparent 99.5%);
@@ -360,6 +376,8 @@ let view = 'library';
 let filterTag = null, filterFolder = null, searchQ = '';
 let railTab = 'notes';
 const app = document.getElementById('app');
+pdfjsLib.GlobalWorkerOptions.workerSrc =
+  'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
 
 const uid = () => Math.random().toString(36).slice(2,9) + Date.now().toString(36).slice(-4);
 const esc = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
@@ -672,36 +690,59 @@ function fixLigatures(str){
   });
 }
 
-async function extractPdf(file){
+// Mutates tc.items in place (ligature fix + a space at line-wraps, unless
+// hyphenated) and returns the page's flat text. Used identically at upload
+// time (to build the stored offset-basis for highlights) and at read time
+// (to build the visual text layer via pdfjsLib.renderTextLayer), so the two
+// always agree character-for-character and highlight offsets stay aligned.
+function preparePageText(tc){
+  // pdf.js sometimes marks a line's end via a *separate* empty-string item
+  // (hasEOL:true, str:"") rather than flagging the preceding content item, so
+  // track the running total rather than checking each item in isolation.
+  let acc = '';
+  tc.items.forEach(it=>{
+    if(it.str===undefined) return;
+    let s = fixLigatures(it.str);
+    acc += s;
+    if(it.hasEOL && acc && !/[-‐-―]$/.test(acc) && !acc.endsWith(' ')){
+      s += ' '; acc += ' ';
+    }
+    it.str = s;
+  });
+  return acc;
+}
+
+// PDFs are shown as-rendered (canvas + an invisible selectable text layer) so
+// layout, fonts and images stay intact — no reflowed/re-wrapped text. `paras[i]`
+// for a PDF article holds page i's full text (one entry per page, not per
+// paragraph) since that's what highlight offsets are anchored against; it also
+// serves as a plain-text fallback if the stored PDF bytes ever fail to reload.
+async function extractPdfForStorage(file){
   const buf = await file.arrayBuffer();
-  pdfjsLib.GlobalWorkerOptions.workerSrc =
-    'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
-  const pdf = await pdfjsLib.getDocument({data:buf}).promise;
-  let out = [];
+  const pdf = await pdfjsLib.getDocument({data: new Uint8Array(buf.slice(0))}).promise;
+  const paras = [];
   for(let p=1; p<=pdf.numPages; p++){
     const page = await pdf.getPage(p);
     const tc = await page.getTextContent();
-    // group items into lines by y position
-    const lines = [];
-    let last = null;
-    tc.items.forEach(it=>{
-      const str = fixLigatures(it.str);
-      const y = Math.round(it.transform[5]);
-      if(last && Math.abs(y-last.y) < 3){ last.text += (last.text.endsWith(' ')||str.startsWith(' ')?'':' ') + str; }
-      else { last = {y, text: str, h: it.height||10}; lines.push(last); }
-    });
-    // merge lines into paragraphs by vertical gap
-    let para = '';
-    for(let i=0;i<lines.length;i++){
-      const l = lines[i], next = lines[i+1];
-      para += (para?' ':'') + l.text.trim();
-      const gap = next ? Math.abs(l.y - next.y) : 999;
-      const breakHere = !next || gap > (l.h*1.9);
-      if(breakHere && para.trim()){ out.push(para.trim()); para=''; }
-    }
-    if(para.trim()) out.push(para.trim());
+    paras.push(preparePageText(tc));
   }
-  return out.filter(p=>p.length>1);
+  return {paras, pdfBytes: buf};
+}
+
+function arrayBufferToBase64(buf){
+  let binary = '';
+  const bytes = new Uint8Array(buf);
+  const chunk = 0x8000;
+  for(let i=0; i<bytes.length; i+=chunk){
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i+chunk));
+  }
+  return btoa(binary);
+}
+function base64ToUint8Array(b64){
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for(let i=0; i<binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
 }
 
 function textToParas(text){
@@ -728,10 +769,13 @@ async function saveNewArticle(){
   if(!title){ toast('Give it a title'); return; }
   btn.textContent = 'Reading…'; btn.disabled = true;
 
-  let paras = [];
+  let paras = [], pdfBytes = null, kind = 'text';
   try{
     if(pendingFile){
-      if(/\.pdf$/i.test(pendingFile.name)) paras = await extractPdf(pendingFile);
+      if(/\.pdf$/i.test(pendingFile.name)){
+        const extracted = await extractPdfForStorage(pendingFile);
+        paras = extracted.paras; pdfBytes = extracted.pdfBytes; kind = 'pdf';
+      }
       else paras = textToParas(await pendingFile.text());
     } else {
       paras = textToParas(pasted);
@@ -744,9 +788,10 @@ async function saveNewArticle(){
   if(!paras.length){ toast('No readable text found in that file'); btn.textContent='Save to desk'; btn.disabled=false; return; }
 
   const id = uid();
-  const meta = {id, title, source, tags, folderId, added:Date.now(), status:'to read', hlCount:0, noteCount:0, progress:0};
+  const meta = {id, title, source, tags, folderId, kind, added:Date.now(), status:'to read', hlCount:0, noteCount:0, progress:0};
   index.push(meta);
   await sSet('lilysnotes:article:'+id, {paras, highlights:[], notes:[]});
+  if(pdfBytes) await sSet('lilysnotes:pdfbytes:'+id, arrayBufferToBase64(pdfBytes));
   await saveIndex();
   document.getElementById('addScrim').remove();
   openArticle(id);
@@ -760,16 +805,28 @@ async function openArticle(id){
   const meta = index.find(a=>a.id===id); if(!meta) return;
   const data = await sGet('lilysnotes:article:'+id);
   if(!data){ toast('Could not load that article'); return; }
-  current = {meta, ...data};
+  current = {meta, ...data, pdfDoc:null};
+  if(meta.kind==='pdf'){
+    try{
+      const b64 = await sGet('lilysnotes:pdfbytes:'+id);
+      if(b64) current.pdfDoc = await pdfjsLib.getDocument({data: base64ToUint8Array(b64)}).promise;
+      else toast('Original PDF not found — showing extracted text instead');
+    }catch(err){
+      console.error(err);
+      toast('Could not re-open the original PDF — showing extracted text instead');
+    }
+  }
   view='reader'; railTab = 'notes';
-  renderReader();
+  await renderReader();
   // restore scroll
   requestAnimationFrame(()=>{
     if(meta.progress) window.scrollTo(0, meta.progress * (document.body.scrollHeight - innerHeight));
   });
 }
 
-function renderReader(){
+const isPdfView = () => current.meta.kind==='pdf' && current.pdfDoc;
+
+async function renderReader(){
   const m = current.meta;
   app.innerHTML = `
     <div class="topbar">
@@ -790,7 +847,9 @@ function renderReader(){
             <span id="countLine"></span>
           </div>
         </div>
-        <div class="article" id="article"></div>
+        <div class="article ${isPdfView()?'pdf-mode':''}" id="article">
+          ${isPdfView() ? '<div class="pdf-loading">Rendering pages…</div>' : ''}
+        </div>
       </div>
       <div class="rail" id="rail">
         <div class="rail-head">
@@ -803,10 +862,10 @@ function renderReader(){
       </div>
     </div>
     <button class="fab-notes" aria-label="Open notes" onclick="document.getElementById('rail').classList.toggle('open')">🗒</button>`;
-  drawArticle();
   drawRail();
   updateCounts();
   attachReaderEvents();
+  await drawArticle();
 }
 
 function updateCounts(){
@@ -817,18 +876,58 @@ function updateCounts(){
   m.noteCount = current.notes.length;
 }
 
-function drawArticle(){
+async function drawArticle(){
   const box = document.getElementById('article');
+  if(isPdfView()){
+    try{ await drawPdfPages(box); return; }
+    catch(err){ console.error(err); toast('Could not render the PDF — showing extracted text instead'); current.pdfDoc = null; }
+  }
   box.innerHTML = current.paras.map((p,i)=>`<p class="para" data-idx="${i}">${renderPara(i)}</p>`).join('');
 }
 
-function renderPara(i){
-  const text = current.paras[i];
-  const hls = current.highlights.filter(h=>h.para===i).sort((a,b)=>a.start-b.start);
+async function drawPdfPages(box){
+  box.innerHTML = '';
+  const pdf = current.pdfDoc;
+  const targetWidth = Math.min(box.clientWidth || 880, 880);
+  for(let p=1; p<=pdf.numPages; p++){
+    const page = await pdf.getPage(p);
+    const baseViewport = page.getViewport({scale:1});
+    const cssScale = targetWidth / baseViewport.width;
+    const dpr = window.devicePixelRatio || 1;
+    const cssViewport = page.getViewport({scale:cssScale});
+    const renderViewport = page.getViewport({scale:cssScale*dpr});
+
+    const wrap = document.createElement('div');
+    wrap.className = 'para pdf-page';
+    wrap.dataset.idx = p-1;
+    wrap.style.width = cssViewport.width+'px';
+    wrap.style.height = cssViewport.height+'px';
+    box.appendChild(wrap);
+
+    const canvas = document.createElement('canvas');
+    canvas.width = renderViewport.width; canvas.height = renderViewport.height;
+    canvas.style.width = cssViewport.width+'px'; canvas.style.height = cssViewport.height+'px';
+    wrap.appendChild(canvas);
+    await page.render({canvasContext: canvas.getContext('2d'), viewport: renderViewport}).promise;
+
+    const tc = await page.getTextContent();
+    preparePageText(tc); // must match extractPdfForStorage exactly so highlight offsets stay aligned
+    const textLayerDiv = document.createElement('div');
+    textLayerDiv.className = 'textLayer';
+    textLayerDiv.style.setProperty('--scale-factor', cssScale);
+    wrap.appendChild(textLayerDiv);
+    await pdfjsLib.renderTextLayer({textContentSource: tc, container: textLayerDiv, viewport: cssViewport}).promise;
+
+    applyMarksToPage(p-1, textLayerDiv);
+  }
+}
+
+function buildMarkedHTML(text, baseOffset, hls){
   if(!hls.length) return esc(text);
   let html = '', pos = 0;
   hls.forEach(h=>{
-    const s = Math.max(pos, h.start), e = Math.min(text.length, h.end);
+    const s = Math.max(pos, h.start-baseOffset), e = Math.min(text.length, h.end-baseOffset);
+    if(s >= e) return;
     if(s > pos) html += esc(text.slice(pos, s));
     const hasNote = current.notes.some(n=>n.hlId===h.id && n.text);
     html += `<mark class="hl ${hasNote?'has-note':''}" data-hl="${h.id}" style="--hlc:${COLORS[h.color]}">${esc(text.slice(s,e))}</mark>`;
@@ -838,7 +937,32 @@ function renderPara(i){
   return html;
 }
 
+function renderPara(i){
+  const hls = current.highlights.filter(h=>h.para===i).sort((a,b)=>a.start-b.start);
+  return buildMarkedHTML(current.paras[i], 0, hls);
+}
+
+// re-applies stored highlights onto an already-rendered PDF page's text layer,
+// without touching the canvas or re-running renderTextLayer
+function applyMarksToPage(pageIdx, textLayerDiv){
+  const hls = current.highlights.filter(h=>h.para===pageIdx).sort((a,b)=>a.start-b.start);
+  const spans = [...textLayerDiv.querySelectorAll('span')].filter(s=>!s.querySelector('span'));
+  let offset = 0;
+  spans.forEach(span=>{
+    const text = span.textContent;
+    const relevant = hls.filter(h=>h.end>offset && h.start<offset+text.length);
+    span.innerHTML = buildMarkedHTML(text, offset, relevant);
+    offset += text.length;
+  });
+}
+
 function redrawPara(i){
+  if(isPdfView()){
+    const wrap = document.querySelector(`.pdf-page[data-idx="${i}"]`);
+    const tl = wrap && wrap.querySelector('.textLayer');
+    if(tl) applyMarksToPage(i, tl);
+    return;
+  }
   const p = document.querySelector(`.para[data-idx="${i}"]`);
   if(p) p.innerHTML = renderPara(i);
 }
