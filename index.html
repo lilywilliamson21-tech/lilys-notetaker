@@ -379,13 +379,60 @@ function toast(msg){
 async function saveIndex(){ await sSet('lilysnotes:index', index); }
 async function saveFolders(){ await sSet('lilysnotes:folders', folders); }
 
+function promptModal(title, hint, placeholder){
+  return new Promise(resolve=>{
+    const scrim = document.createElement('div');
+    scrim.className='scrim';
+    scrim.onclick = e=>{ if(e.target===scrim){ scrim.remove(); resolve(null); } };
+    scrim.innerHTML = `
+      <div class="modal" style="width:min(380px,100%)">
+        <h2>${esc(title)}</h2>
+        <div class="hint">${esc(hint)}</div>
+        <div class="field"><input type="text" id="pmInput" placeholder="${esc(placeholder)}"></div>
+        <div class="actions">
+          <button class="btn" id="pmCancel">Cancel</button>
+          <button class="btn primary" id="pmOk">Create</button>
+        </div>
+      </div>`;
+    document.body.appendChild(scrim);
+    const input = scrim.querySelector('#pmInput');
+    input.focus();
+    const finish = ()=>{ const v = input.value.trim(); scrim.remove(); resolve(v || null); };
+    scrim.querySelector('#pmOk').onclick = finish;
+    scrim.querySelector('#pmCancel').onclick = ()=>{ scrim.remove(); resolve(null); };
+    input.onkeydown = e=>{
+      if(e.key==='Enter'){ e.preventDefault(); finish(); }
+      if(e.key==='Escape'){ scrim.remove(); resolve(null); }
+    };
+  });
+}
+
+function confirmModal(title, hint, confirmLabel){
+  return new Promise(resolve=>{
+    const scrim = document.createElement('div');
+    scrim.className='scrim';
+    scrim.onclick = e=>{ if(e.target===scrim){ scrim.remove(); resolve(false); } };
+    scrim.innerHTML = `
+      <div class="modal" style="width:min(380px,100%)">
+        <h2>${esc(title)}</h2>
+        <div class="hint">${esc(hint)}</div>
+        <div class="actions">
+          <button class="btn" id="cmCancel">Cancel</button>
+          <button class="btn primary" id="cmOk" style="background:#a4485e; border-color:#a4485e">${esc(confirmLabel)}</button>
+        </div>
+      </div>`;
+    document.body.appendChild(scrim);
+    scrim.querySelector('#cmCancel').onclick = ()=>{ scrim.remove(); resolve(false); };
+    scrim.querySelector('#cmOk').onclick = ()=>{ scrim.remove(); resolve(true); };
+  });
+}
+
 async function createFolder(){
-  const name = prompt('Name this folder (e.g. a class like "PSCI 0200")');
-  if(!name || !name.trim()) return null;
-  const trimmed = name.trim();
-  let f = folders.find(x=>x.name.toLowerCase()===trimmed.toLowerCase());
+  const name = await promptModal('New folder', 'Give it a name — like a class you’re sorting readings for.', 'e.g. PSCI 0200');
+  if(!name) return null;
+  let f = folders.find(x=>x.name.toLowerCase()===name.toLowerCase());
   if(f){ toast('That folder already exists'); return f; }
-  f = {id:uid(), name:trimmed};
+  f = {id:uid(), name};
   folders.push(f);
   await saveFolders();
   return f;
@@ -401,7 +448,8 @@ async function addFolderFromLibrary(){
 
 async function deleteFolder(id){
   const f = folders.find(x=>x.id===id); if(!f) return;
-  if(!confirm(`Delete the "${f.name}" folder? Articles inside won't be deleted, just unsorted.`)) return;
+  const ok = await confirmModal('Delete folder?', `Delete the "${f.name}" folder? Articles inside won’t be deleted, just unsorted.`, 'Delete folder');
+  if(!ok) return;
   folders = folders.filter(x=>x.id!==id);
   index.forEach(a=>{ if(a.folderId===id) a.folderId=null; });
   if(filterFolder===id) filterFolder=null;
@@ -527,7 +575,8 @@ async function cycleStatus(id){
 
 async function deleteArticle(id){
   const a = index.find(x=>x.id===id);
-  if(!confirm(`Delete “${a.title}” and all its annotations?`)) return;
+  const ok = await confirmModal('Delete article?', `Delete "${a.title}" and all its annotations?`, 'Delete article');
+  if(!ok) return;
   index = index.filter(x=>x.id!==id);
   await saveIndex(); await sDel('lilysnotes:article:'+id);
   renderLibrary(); toast('Article deleted');
