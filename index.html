@@ -108,6 +108,33 @@ input,textarea,select{font-family:var(--ui); color:var(--ink); font-size:14px}
 .card .meta b{color:var(--ink); font-weight:500}
 .tagrow{display:flex; gap:6px; flex-wrap:wrap}
 .tag{font-size:11px; font-weight:700; letter-spacing:.03em; padding:3px 9px; border-radius:999px; background:var(--lilac); color:var(--accent-deep)}
+.folder-row{display:flex; gap:12px; flex-wrap:wrap; margin:4px 0 20px}
+.folder-pill{
+  position:relative; display:inline-flex; align-items:center; gap:7px;
+  background:var(--blush); color:#a4485e; font-size:12.5px; font-weight:700;
+  padding:8px 14px 8px 12px; border-radius:3px 10px 10px 10px; cursor:pointer;
+  transition:transform .12s ease, box-shadow .12s ease;
+}
+.folder-pill::before{
+  content:""; position:absolute; top:-6px; left:0; width:36%; height:7px;
+  background:var(--blush); border-radius:4px 4px 0 0;
+}
+.folder-pill:hover{transform:translateY(-1px)}
+.folder-pill.on{box-shadow:0 0 0 2px var(--accent-deep) inset}
+.folder-pill .count{font-family:var(--mono); font-size:10.5px; font-weight:400; opacity:.75}
+.folder-pill .del{font-size:11px; opacity:0; padding:1px 3px; border-radius:5px}
+.folder-pill:hover .del{opacity:.7}
+.folder-pill .del:hover{opacity:1; background:rgba(255,255,255,.5)}
+.folder-pill.new{
+  background:transparent; border:1.5px dashed var(--line); color:var(--ink-soft); font-weight:500;
+  padding:8px 14px;
+}
+.folder-pill.new::before{display:none}
+.folder-select{
+  font-family:var(--ui); font-size:11px; padding:3px 9px; border-radius:999px; border:1px dashed var(--line);
+  background:transparent; color:var(--ink-soft); cursor:pointer; max-width:120px;
+}
+.folder-select.set{border-style:solid; border-color:var(--blush); background:var(--blush); color:#a4485e; font-weight:700}
 .status-toggle{
   align-self:flex-start; font-family:var(--mono); font-size:11px; padding:4px 10px;
   border-radius:999px; border:1px dashed var(--line); color:var(--ink-soft);
@@ -322,10 +349,11 @@ async function sDel(key){
 }
 
 /* ---------- state ---------- */
-let index = [];            // [{id,title,source,tags,added,status,hlCount,noteCount,progress}]
+let index = [];            // [{id,title,source,tags,folderId,added,status,hlCount,noteCount,progress}]
+let folders = [];          // [{id,name}]
 let current = null;        // {id, paras:[], highlights:[], notes:[]}
 let view = 'library';
-let filterTag = null, searchQ = '';
+let filterTag = null, filterFolder = null, searchQ = '';
 let railTab = 'notes';
 const app = document.getElementById('app');
 
@@ -344,10 +372,48 @@ function toast(msg){
 /* ---------- boot ---------- */
 (async function boot(){
   index = (await sGet('lilysnotes:index')) || [];
+  folders = (await sGet('lilysnotes:folders')) || [];
   renderLibrary();
 })();
 
 async function saveIndex(){ await sSet('lilysnotes:index', index); }
+async function saveFolders(){ await sSet('lilysnotes:folders', folders); }
+
+async function createFolder(){
+  const name = prompt('Name this folder (e.g. a class like "PSCI 0200")');
+  if(!name || !name.trim()) return null;
+  const trimmed = name.trim();
+  let f = folders.find(x=>x.name.toLowerCase()===trimmed.toLowerCase());
+  if(f){ toast('That folder already exists'); return f; }
+  f = {id:uid(), name:trimmed};
+  folders.push(f);
+  await saveFolders();
+  return f;
+}
+
+async function addFolderFromLibrary(){
+  const f = await createFolder();
+  if(!f) return;
+  filterFolder = f.id;
+  renderLibrary();
+  toast('Folder created ✓');
+}
+
+async function deleteFolder(id){
+  const f = folders.find(x=>x.id===id); if(!f) return;
+  if(!confirm(`Delete the "${f.name}" folder? Articles inside won't be deleted, just unsorted.`)) return;
+  folders = folders.filter(x=>x.id!==id);
+  index.forEach(a=>{ if(a.folderId===id) a.folderId=null; });
+  if(filterFolder===id) filterFolder=null;
+  await saveFolders(); await saveIndex();
+  renderLibrary(); toast('Folder deleted');
+}
+
+async function assignFolder(articleId, folderId){
+  const a = index.find(x=>x.id===articleId); if(!a) return;
+  a.folderId = folderId || null;
+  await saveIndex(); refreshGrid();
+}
 
 /* =========================================================
    LIBRARY VIEW
@@ -363,7 +429,8 @@ function renderLibrary(){
   const tags = allTags();
   const visible = index
     .filter(a => !filterTag || (a.tags||[]).includes(filterTag))
-    .filter(a => !searchQ || (a.title+' '+(a.source||'')+' '+(a.tags||[]).join(' ')).toLowerCase().includes(searchQ.toLowerCase()))
+    .filter(a => !filterFolder || a.folderId===filterFolder)
+    .filter(a => !searchQ || (a.title+' '+(a.source||'')+' '+(a.tags||[]).join(' ')+' '+(folders.find(f=>f.id===a.folderId)?.name||'')).toLowerCase().includes(searchQ.toLowerCase()))
     .sort((a,b)=>b.added-a.added);
   const totHl = index.reduce((n,a)=>n+(a.hlCount||0),0);
   const totNotes = index.reduce((n,a)=>n+(a.noteCount||0),0);
@@ -390,6 +457,14 @@ function renderLibrary(){
         ${tags.map(t=>`<button class="filter-chip ${filterTag===t?'on':''}"
           onclick="filterTag = filterTag==='${esc(t)}' ? null : '${esc(t)}'; renderLibrary()">${esc(t)}</button>`).join('')}
       </div>
+      <div class="folder-row">
+        ${folders.map(f=>`<div class="folder-pill ${filterFolder===f.id?'on':''}"
+          onclick="filterFolder = filterFolder==='${f.id}' ? null : '${f.id}'; renderLibrary()">
+          📁 ${esc(f.name)} <span class="count">${index.filter(a=>a.folderId===f.id).length}</span>
+          <span class="del" title="Delete folder" onclick="event.stopPropagation(); deleteFolder('${f.id}')">✕</span>
+        </div>`).join('')}
+        <div class="folder-pill new" onclick="addFolderFromLibrary()">＋ New folder</div>
+      </div>
       <div class="stats-line">${index.length} article${index.length===1?'':'s'} · ${totHl} highlights · ${totNotes} sticky notes</div>
       <div class="grid" id="grid"></div>
     </div>`;
@@ -399,7 +474,8 @@ function renderLibrary(){
 function refreshGrid(){
   const visible = index
     .filter(a => !filterTag || (a.tags||[]).includes(filterTag))
-    .filter(a => !searchQ || (a.title+' '+(a.source||'')+' '+(a.tags||[]).join(' ')).toLowerCase().includes(searchQ.toLowerCase()))
+    .filter(a => !filterFolder || a.folderId===filterFolder)
+    .filter(a => !searchQ || (a.title+' '+(a.source||'')+' '+(a.tags||[]).join(' ')+' '+(folders.find(f=>f.id===a.folderId)?.name||'')).toLowerCase().includes(searchQ.toLowerCase()))
     .sort((a,b)=>b.added-a.added);
   drawGrid(visible);
 }
@@ -428,8 +504,15 @@ function drawGrid(list){
         <span>${fmtDate(a.added)}</span>
       </div>
       <div class="rowend">
-        <button class="status-toggle" data-s="${a.status||'to read'}"
-          onclick="event.stopPropagation(); cycleStatus('${a.id}')">${a.status||'to read'}</button>
+        <div style="display:flex; align-items:center; gap:6px">
+          <button class="status-toggle" data-s="${a.status||'to read'}"
+            onclick="event.stopPropagation(); cycleStatus('${a.id}')">${a.status||'to read'}</button>
+          <select class="folder-select ${a.folderId?'set':''}" title="Sort into a folder"
+            onclick="event.stopPropagation()" onchange="event.stopPropagation(); assignFolder('${a.id}', this.value)">
+            <option value="" ${!a.folderId?'selected':''}>No folder</option>
+            ${folders.map(f=>`<option value="${f.id}" ${a.folderId===f.id?'selected':''}>${esc(f.name)}</option>`).join('')}
+          </select>
+        </div>
         <button class="trash" title="Delete article" onclick="event.stopPropagation(); deleteArticle('${a.id}')">🗑</button>
       </div>
     </div>`).join('');
@@ -475,12 +558,33 @@ function openAddModal(){
       <div class="field"><label>Title</label><input type="text" id="titleBox" placeholder="e.g. Democratic Backsliding in Comparative Perspective"></div>
       <div class="field"><label>Source / author <span style="text-transform:none;font-weight:400">(optional)</span></label><input type="text" id="srcBox" placeholder="e.g. Levitsky & Ziblatt, Journal of Democracy"></div>
       <div class="field"><label>Tags <span style="text-transform:none;font-weight:400">(comma-separated)</span></label><input type="text" id="tagBox" placeholder="e.g. PSCI 0200, week 3"></div>
+      <div class="field"><label>Folder <span style="text-transform:none;font-weight:400">(optional — sort by class)</span></label>
+        <select id="folderBox">
+          <option value="">No folder</option>
+          ${folders.map(f=>`<option value="${f.id}">${esc(f.name)}</option>`).join('')}
+          <option value="__new__">＋ Create new folder…</option>
+        </select>
+      </div>
       <div class="actions">
         <button class="btn" onclick="document.getElementById('addScrim').remove()">Cancel</button>
         <button class="btn primary" id="saveBtn" onclick="saveNewArticle()">Save to desk</button>
       </div>
     </div>`;
   document.body.appendChild(scrim);
+
+  const folderBox = scrim.querySelector('#folderBox');
+  folderBox.onchange = async ()=>{
+    if(folderBox.value !== '__new__') return;
+    const f = await createFolder();
+    if(f){
+      const opt = document.createElement('option');
+      opt.value = f.id; opt.textContent = f.name;
+      folderBox.insertBefore(opt, folderBox.lastElementChild);
+      folderBox.value = f.id;
+    } else {
+      folderBox.value = '';
+    }
+  };
 
   const dz = scrim.querySelector('#dz'), fi = scrim.querySelector('#fileInput');
   dz.onclick = ()=>fi.click();
@@ -545,6 +649,8 @@ async function saveNewArticle(){
   const title = document.getElementById('titleBox').value.trim();
   const source = document.getElementById('srcBox').value.trim();
   const tags = document.getElementById('tagBox').value.split(',').map(t=>t.trim()).filter(Boolean);
+  const folderVal = document.getElementById('folderBox').value;
+  const folderId = folderVal && folderVal!=='__new__' ? folderVal : null;
   const pasted = document.getElementById('pasteBox').value.trim();
 
   if(!pendingFile && !pasted){ toast('Add a file or paste some text first'); return; }
@@ -567,7 +673,7 @@ async function saveNewArticle(){
   if(!paras.length){ toast('No readable text found in that file'); btn.textContent='Save to desk'; btn.disabled=false; return; }
 
   const id = uid();
-  const meta = {id, title, source, tags, added:Date.now(), status:'to read', hlCount:0, noteCount:0, progress:0};
+  const meta = {id, title, source, tags, folderId, added:Date.now(), status:'to read', hlCount:0, noteCount:0, progress:0};
   index.push(meta);
   await sSet('lilysnotes:article:'+id, {paras, highlights:[], notes:[]});
   await saveIndex();
