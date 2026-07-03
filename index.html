@@ -655,6 +655,23 @@ function openAddModal(){
   }
 }
 
+// some PDF fonts lack a ToUnicode entry for ligature glyphs (fi/fl), so pdf.js
+// extracts them as a stray control character — invisible in HTML, so "fifteen"
+// silently becomes "fteen". Disambiguate using a common "fl"-word list (fi is
+// far more frequent) and drop lone control-char runs (decorative dinkus glyphs).
+const FL_WORDS = new Set(['flag','flags','flagged','flagging','flagrant','flagship','flail','flair','flake','flaky','flame','flamed','flames','flaming','flammable','flamboyant','flank','flannel','flap','flapped','flapping','flare','flared','flares','flash','flashed','flashes','flashy','flask','flat','flats','flatten','flattened','flattening','flatter','flattered','flattering','flattery','flaunt','flaunted','flaunting','flavor','flavored','flavoring','flavors','flavour','flavoured','flavours','flaw','flawed','flawless','flaws','flea','fleas','fled','flee','fleece','fleeing','fleet','fleeting','flesh','fleshed','fleshy','flew','flex','flexed','flexes','flexibility','flexible','flick','flicked','flicker','flickered','flickering','flickers','flies','flight','flights','flighty','flimsy','fling','flinch','flinched','flinches','flinching','flint','flip','flipped','flipping','flips','flippant','flirt','flirted','flirting','flirtatious','float','floated','floating','floats','flock','flocked','flocking','flocks','flood','flooded','flooding','floods','floor','floors','flop','flopped','flopping','flops','floppy','floral','florid','florist','flotilla','flounder','floundered','floundering','flour','flourish','flourished','flourishing','flout','flow','flowed','flower','flowered','flowering','flowers','flowing','flown','flows','flu','fluctuate','fluctuated','fluctuating','fluctuation','fluctuations','flue','fluency','fluent','fluently','fluff','fluffy','fluid','fluids','fluke','flung','flunk','fluorescent','fluoride','flurry','flush','flushed','flushes','flushing','fluster','flustered','flute','flutter','fluttered','fluttering','flux','fly','flyer','flyers','flying','afflict','afflicted','afflicting','afflicts','affliction','afflictions','conflict','conflicted','conflicting','conflicts','deflate','deflated','deflect','deflected','deflecting','deflects','inflame','inflamed','inflammation','inflammatory','inflate','inflated','inflates','inflating','inflation','inflect','inflected','inflection','inflict','inflicted','inflicting','inflicts','reflect','reflected','reflecting','reflection','reflections','reflective','reflects','reflex','reflexes','reflexive']);
+function fixLigatures(str){
+  if(!/[\x00-\x08\x0B\x0C\x0E-\x1F]/.test(str)) return str;
+  const stripped = str.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\s]/g,'');
+  if(stripped === '') return '';
+  return str.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, (match, offset, full) => {
+    const before = full.slice(0, offset).match(/[A-Za-z]*$/)[0];
+    const after = full.slice(offset + match.length).match(/^[A-Za-z]*/)[0];
+    const tryFl = (before + 'fl' + after).toLowerCase();
+    return FL_WORDS.has(tryFl) ? 'fl' : 'fi';
+  });
+}
+
 async function extractPdf(file){
   const buf = await file.arrayBuffer();
   pdfjsLib.GlobalWorkerOptions.workerSrc =
@@ -668,9 +685,10 @@ async function extractPdf(file){
     const lines = [];
     let last = null;
     tc.items.forEach(it=>{
+      const str = fixLigatures(it.str);
       const y = Math.round(it.transform[5]);
-      if(last && Math.abs(y-last.y) < 3){ last.text += (last.text.endsWith(' ')||it.str.startsWith(' ')?'':' ') + it.str; }
-      else { last = {y, text: it.str, h: it.height||10}; lines.push(last); }
+      if(last && Math.abs(y-last.y) < 3){ last.text += (last.text.endsWith(' ')||str.startsWith(' ')?'':' ') + str; }
+      else { last = {y, text: str, h: it.height||10}; lines.push(last); }
     });
     // merge lines into paragraphs by vertical gap
     let para = '';
