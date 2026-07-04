@@ -235,6 +235,16 @@ mark.hl.flash{animation:flash .9s ease}
 .seltool .tool{color:#fff; font-size:13px; font-weight:500; padding:2px 6px; border-radius:6px; display:flex; gap:5px; align-items:center}
 .seltool .tool:hover{background:rgba(255,255,255,.14)}
 
+/* highlighter tool (persistent click-to-paint mode) */
+.hl-tool-btn{position:relative}
+.hl-tool-btn.on{background:var(--paper); box-shadow:0 0 0 2px var(--accent) inset}
+.hlToolPop{
+  position:absolute; z-index:70; display:flex; gap:8px; align-items:center;
+  background:var(--card); border:1px solid var(--line); border-radius:999px;
+  padding:9px 12px; box-shadow:var(--shadow-lift); animation:pop .14s ease;
+}
+.hlToolPop .swatch{border-color:var(--line)}
+
 /* ---------- notes rail ---------- */
 .rail{
   width:340px; flex-shrink:0; position:sticky; top:63px; height:calc(100vh - 63px);
@@ -341,11 +351,24 @@ mark.hl.flash{animation:flash .9s ease}
    Lily's Notetaker — a reading & annotation desk
    ========================================================= */
 
+// muted "dusty" highlight palette — desaturated pastels so text stays legible underneath
 const COLORS = {
-  butter:'#FDF3B4', mint:'#CDEBD8', sky:'#CFE4F7', blush:'#F9D8DF', lilac:'#E3D7F3'
+  blush:'#E8D3D2', sky:'#C9DAE2', mint:'#D3DECB', butter:'#E6D9BC', lilac:'#DAD0DE'
 };
-const COLOR_ORDER = ['butter','mint','sky','blush','lilac'];
+const COLOR_ORDER = ['blush','sky','mint','butter','lilac'];
+const COLOR_LABELS = {blush:'dusty rose', sky:'dusty blue', mint:'dusty green', butter:'dusty gold', lilac:'dusty lavender'};
 const FOLDER_ICON = `<svg class="ficon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6.5a1.5 1.5 0 0 1 1.5-1.5h4.4l1.8 2H19a1.5 1.5 0 0 1 1.5 1.5v8.5a1.5 1.5 0 0 1-1.5 1.5H4.5A1.5 1.5 0 0 1 3 17V6.5z"/></svg>`;
+
+// minimalist highlighter-pen icon; the cap is only drawn when the tool is off
+function highlighterIcon(active, color){
+  const nibFill = color ? COLORS[color] : 'none';
+  const nibStroke = color ? 'none' : 'currentColor';
+  return `<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M9.3 14.5 L6.8 21 L11.2 21 L13.2 14.5 Z" fill="${nibFill}" stroke="${nibStroke}"/>
+    <rect x="7" y="6.5" width="8.5" height="8" rx="1.1"/>
+    ${active ? '' : '<rect x="6.6" y="2" width="9.3" height="5" rx="1.3"/>'}
+  </svg>`;
+}
 
 /* ---------- storage: Claude artifact storage → localStorage → memory ---------- */
 const mem = {};
@@ -375,6 +398,7 @@ let current = null;        // {id, paras:[], highlights:[], notes:[]}
 let view = 'library';
 let filterTag = null, filterFolder = null, searchQ = '';
 let railTab = 'notes';
+let highlighterMode = false, activeHlColor = null;
 const app = document.getElementById('app');
 pdfjsLib.GlobalWorkerOptions.workerSrc =
   'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
@@ -833,6 +857,8 @@ async function renderReader(){
       <div class="wordmark" onclick="renderLibrary()"><span class="tab-dot"></span>Lily’s Notetaker</div>
       <div class="crumb">/ ${esc(m.title)}</div>
       <div class="spacer"></div>
+      <button class="btn small hl-tool-btn ${highlighterMode?'on':''}" id="hlToolBtn" title="Highlighter tool — pick a color, then just select text"
+        onclick="toggleHlTool(event)">${highlighterIcon(highlighterMode, activeHlColor)}</button>
       <button class="btn small" onclick="copyNotesMarkdown()">Copy notes ⧉</button>
       <button class="btn small rail-toggle" onclick="document.getElementById('rail').classList.toggle('open')">Notes 🗒</button>
       <button class="btn small" onclick="renderLibrary()">← Desk</button>
@@ -989,17 +1015,18 @@ function attachReaderEvents(){
   globalListenersOn = true;
 
   document.addEventListener('mouseup', e=>{
-    if(e.target.closest && (e.target.closest('.seltool') || e.target.closest('.hlpop') || e.target.closest('.rail'))) return;
+    if(e.target.closest && (e.target.closest('.seltool') || e.target.closest('.hlpop') || e.target.closest('.rail') || e.target.closest('.hlToolPop') || e.target.closest('#hlToolBtn'))) return;
     onSelectMaybe();
   });
   document.addEventListener('touchend', e=>{
-    if(e.target.closest && (e.target.closest('.seltool') || e.target.closest('.hlpop') || e.target.closest('.rail'))) return;
+    if(e.target.closest && (e.target.closest('.seltool') || e.target.closest('.hlpop') || e.target.closest('.rail') || e.target.closest('.hlToolPop') || e.target.closest('#hlToolBtn'))) return;
     setTimeout(onSelectMaybe, 10);
   });
 
   document.addEventListener('click', e=>{
     if(!e.target.closest('.seltool')) removeSelTool();
     if(!e.target.closest('.hlpop') && !e.target.closest('mark.hl')) removeHlPop();
+    if(!e.target.closest('.hlToolPop') && !e.target.closest('#hlToolBtn')) removeHlToolPopover();
   });
 
   // save reading progress (throttled)
@@ -1044,6 +1071,37 @@ function getSelectionInfo(){
   return {a, b, rect};
 }
 
+function toggleHlTool(e){
+  e.stopPropagation();
+  if(highlighterMode){
+    highlighterMode = false; activeHlColor = null;
+    removeHlToolPopover(); refreshHlToolBtn(); removeSelTool();
+    return;
+  }
+  if(document.getElementById('hlToolPop')){ removeHlToolPopover(); return; }
+  const btn = document.getElementById('hlToolBtn');
+  const pop = document.createElement('div');
+  pop.className = 'hlToolPop'; pop.id = 'hlToolPop';
+  pop.innerHTML = COLOR_ORDER.map(c=>
+    `<button class="swatch" title="${COLOR_LABELS[c]}" style="background:${COLORS[c]}" onclick="chooseHlColor('${c}')"></button>`
+  ).join('');
+  document.body.appendChild(pop);
+  const r = btn.getBoundingClientRect();
+  pop.style.top = (r.bottom + scrollY + 8) + 'px';
+  pop.style.left = Math.max(8, Math.min(innerWidth - pop.offsetWidth - 8, r.left)) + 'px';
+}
+function chooseHlColor(c){
+  activeHlColor = c; highlighterMode = true;
+  removeHlToolPopover(); refreshHlToolBtn();
+}
+function removeHlToolPopover(){ document.querySelectorAll('.hlToolPop').forEach(p=>p.remove()); }
+function refreshHlToolBtn(){
+  const btn = document.getElementById('hlToolBtn');
+  if(!btn) return;
+  btn.classList.toggle('on', highlighterMode);
+  btn.innerHTML = highlighterIcon(highlighterMode, activeHlColor);
+}
+
 let pendingSel = null;
 function onSelectMaybe(){
   if(view!=='reader') return;
@@ -1051,10 +1109,14 @@ function onSelectMaybe(){
   const info = getSelectionInfo();
   if(!info) return;
   pendingSel = info;
+  if(highlighterMode && activeHlColor){
+    applyHighlight(activeHlColor, false);
+    return;
+  }
   const tool = document.createElement('div');
   tool.className='seltool';
   tool.innerHTML = COLOR_ORDER.map(c=>
-    `<button class="swatch" title="Highlight ${c}" style="background:${COLORS[c]}" onclick="applyHighlight('${c}', false)"></button>`
+    `<button class="swatch" title="Highlight ${COLOR_LABELS[c]}" style="background:${COLORS[c]}" onclick="applyHighlight('${c}', false)"></button>`
   ).join('') + `<div class="divider"></div>
     <button class="tool" onclick="applyHighlight('butter', true)">✎ Note</button>`;
   document.body.appendChild(tool);
