@@ -244,6 +244,7 @@ mark.hl.flash{animation:flash .9s ease}
   padding:9px 12px; box-shadow:var(--shadow-lift); animation:pop .14s ease;
 }
 .hlToolPop .swatch{border-color:var(--line)}
+.eraser-btn.on{background:var(--paper); box-shadow:0 0 0 2px #a4485e inset; color:#a4485e}
 
 /* ---------- notes rail ---------- */
 .rail{
@@ -370,6 +371,11 @@ function highlighterIcon(active, color){
   </svg>`;
 }
 
+const ERASER_ICON = `<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+  <rect x="5.5" y="10.5" width="13" height="7" rx="1.3" transform="rotate(-35 12 14)"/>
+  <path d="M6.5 19 L17.5 19"/>
+</svg>`;
+
 /* ---------- storage: Claude artifact storage → localStorage → memory ---------- */
 const mem = {};
 const hasClaudeStore = typeof window.storage !== 'undefined';
@@ -399,6 +405,7 @@ let view = 'library';
 let filterTag = null, filterFolder = null, searchQ = '';
 let railTab = 'notes';
 let highlighterMode = false, activeHlColor = null;
+let eraserMode = false;
 const app = document.getElementById('app');
 pdfjsLib.GlobalWorkerOptions.workerSrc =
   'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
@@ -859,6 +866,8 @@ async function renderReader(){
       <div class="spacer"></div>
       <button class="btn small hl-tool-btn ${highlighterMode?'on':''}" id="hlToolBtn" title="Highlighter tool — pick a color, then just select text"
         onclick="toggleHlTool(event)">${highlighterIcon(highlighterMode, activeHlColor)}</button>
+      <button class="btn small eraser-btn ${eraserMode?'on':''}" id="eraserBtn" title="Eraser — select over a highlight to remove it"
+        onclick="toggleEraserTool(event)">${ERASER_ICON}</button>
       <button class="btn small" onclick="copyNotesMarkdown()">Copy notes ⧉</button>
       <button class="btn small rail-toggle" onclick="document.getElementById('rail').classList.toggle('open')">Notes 🗒</button>
       <button class="btn small" onclick="renderLibrary()">← Desk</button>
@@ -1015,11 +1024,11 @@ function attachReaderEvents(){
   globalListenersOn = true;
 
   document.addEventListener('mouseup', e=>{
-    if(e.target.closest && (e.target.closest('.seltool') || e.target.closest('.hlpop') || e.target.closest('.rail') || e.target.closest('.hlToolPop') || e.target.closest('#hlToolBtn'))) return;
+    if(e.target.closest && (e.target.closest('.seltool') || e.target.closest('.hlpop') || e.target.closest('.rail') || e.target.closest('.hlToolPop') || e.target.closest('#hlToolBtn') || e.target.closest('#eraserBtn'))) return;
     onSelectMaybe();
   });
   document.addEventListener('touchend', e=>{
-    if(e.target.closest && (e.target.closest('.seltool') || e.target.closest('.hlpop') || e.target.closest('.rail') || e.target.closest('.hlToolPop') || e.target.closest('#hlToolBtn'))) return;
+    if(e.target.closest && (e.target.closest('.seltool') || e.target.closest('.hlpop') || e.target.closest('.rail') || e.target.closest('.hlToolPop') || e.target.closest('#hlToolBtn') || e.target.closest('#eraserBtn'))) return;
     setTimeout(onSelectMaybe, 10);
   });
 
@@ -1079,6 +1088,7 @@ function toggleHlTool(e){
     return;
   }
   if(document.getElementById('hlToolPop')){ removeHlToolPopover(); return; }
+  if(eraserMode){ eraserMode = false; refreshEraserBtn(); }
   const btn = document.getElementById('hlToolBtn');
   const pop = document.createElement('div');
   pop.className = 'hlToolPop'; pop.id = 'hlToolPop';
@@ -1102,6 +1112,21 @@ function refreshHlToolBtn(){
   btn.innerHTML = highlighterIcon(highlighterMode, activeHlColor);
 }
 
+function toggleEraserTool(e){
+  e.stopPropagation();
+  eraserMode = !eraserMode;
+  if(eraserMode){
+    highlighterMode = false; activeHlColor = null;
+    removeHlToolPopover(); refreshHlToolBtn();
+  }
+  removeSelTool();
+  refreshEraserBtn();
+}
+function refreshEraserBtn(){
+  const btn = document.getElementById('eraserBtn');
+  if(btn) btn.classList.toggle('on', eraserMode);
+}
+
 let pendingSel = null;
 function onSelectMaybe(){
   if(view!=='reader') return;
@@ -1109,6 +1134,10 @@ function onSelectMaybe(){
   const info = getSelectionInfo();
   if(!info) return;
   pendingSel = info;
+  if(eraserMode){
+    eraseHighlights();
+    return;
+  }
   if(highlighterMode && activeHlColor){
     applyHighlight(activeHlColor, false);
     return;
@@ -1174,6 +1203,52 @@ async function applyHighlight(color, withNote){
   } else {
     await persist(); drawRail();
   }
+}
+
+async function eraseHighlights(){
+  if(!pendingSel) return;
+  const {a,b} = pendingSel;
+  const spans = [];
+  if(a.idx === b.idx){
+    if(b.off > a.off) spans.push({para:a.idx, start:a.off, end:b.off});
+  } else {
+    const [lo, hi] = a.idx < b.idx ? [a,b] : [b,a];
+    spans.push({para:lo.idx, start:lo.off, end:current.paras[lo.idx].length});
+    for(let i=lo.idx+1; i<hi.idx; i++) spans.push({para:i, start:0, end:current.paras[i].length});
+    spans.push({para:hi.idx, start:0, end:hi.off});
+  }
+  let erasedAny = false;
+  const affectedParas = new Set();
+  spans.forEach(sp=>{
+    const overlapping = current.highlights.filter(h=>h.para===sp.para && h.start<sp.end && h.end>sp.start);
+    overlapping.forEach(h=>{
+      erasedAny = true;
+      affectedParas.add(h.para);
+      const pieces = [];
+      if(h.start < sp.start) pieces.push([h.start, sp.start]);
+      if(h.end > sp.end) pieces.push([sp.end, h.end]);
+      current.highlights = current.highlights.filter(x=>x.id!==h.id);
+      if(pieces.length===0){
+        // fully erased — its sticky note (if any) goes with it
+        current.notes = current.notes.filter(n=>n.hlId!==h.id);
+      } else {
+        // partially erased — the first remaining piece keeps the original id
+        // (and therefore any attached note); any second piece is a fresh highlight
+        pieces.forEach(([s,e], i)=>{
+          current.highlights.push({
+            id: i===0 ? h.id : uid(), para:h.para, start:s, end:e, color:h.color,
+            text: current.paras[h.para].slice(s,e), created:h.created
+          });
+        });
+      }
+    });
+  });
+  window.getSelection().removeAllRanges();
+  removeSelTool();
+  pendingSel = null;
+  if(!erasedAny){ toast('Nothing highlighted there'); return; }
+  affectedParas.forEach(i=>redrawPara(i));
+  await persist(); drawRail();
 }
 
 /* ---------- highlight popover ---------- */
