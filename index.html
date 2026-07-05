@@ -397,6 +397,60 @@ async function sDel(key){
   delete mem[key];
 }
 
+// PDFs are stored in IndexedDB rather than localStorage — localStorage caps out
+// around 5-10MB shared across the whole site, so a couple of multi-MB PDFs is
+// enough to silently fail future saves. IndexedDB grants far more headroom and
+// stores the ArrayBuffer natively (no base64 inflation needed).
+const PDF_DB_NAME = 'lilysnotes-pdfs', PDF_STORE = 'pdfs';
+let pdfDbPromise = null;
+function openPdfDb(){
+  if(pdfDbPromise) return pdfDbPromise;
+  pdfDbPromise = new Promise(resolve=>{
+    if(!('indexedDB' in window)){ resolve(null); return; }
+    const req = indexedDB.open(PDF_DB_NAME, 1);
+    req.onupgradeneeded = ()=>{ req.result.createObjectStore(PDF_STORE); };
+    req.onsuccess = ()=>resolve(req.result);
+    req.onerror = ()=>resolve(null);
+  });
+  return pdfDbPromise;
+}
+async function idbSetPdf(id, arrayBuffer){
+  const db = await openPdfDb();
+  if(!db) return false;
+  return new Promise(resolve=>{
+    try{
+      const tx = db.transaction(PDF_STORE, 'readwrite');
+      tx.objectStore(PDF_STORE).put(arrayBuffer, id);
+      tx.oncomplete = ()=>resolve(true);
+      tx.onerror = ()=>resolve(false);
+    }catch(e){ resolve(false); }
+  });
+}
+async function idbGetPdf(id){
+  const db = await openPdfDb();
+  if(!db) return null;
+  return new Promise(resolve=>{
+    try{
+      const tx = db.transaction(PDF_STORE, 'readonly');
+      const req = tx.objectStore(PDF_STORE).get(id);
+      req.onsuccess = ()=>resolve(req.result || null);
+      req.onerror = ()=>resolve(null);
+    }catch(e){ resolve(null); }
+  });
+}
+async function idbDeletePdf(id){
+  const db = await openPdfDb();
+  if(!db) return;
+  return new Promise(resolve=>{
+    try{
+      const tx = db.transaction(PDF_STORE, 'readwrite');
+      tx.objectStore(PDF_STORE).delete(id);
+      tx.oncomplete = ()=>resolve();
+      tx.onerror = ()=>resolve();
+    }catch(e){ resolve(); }
+  });
+}
+
 /* ---------- state ---------- */
 let index = [];            // [{id,title,source,tags,folderId,added,status,hlCount,noteCount,progress}]
 let folders = [];          // [{id,name}]
@@ -631,7 +685,7 @@ async function deleteArticle(id){
   const ok = await confirmModal('Delete article?', `Delete "${a.title}" and all its annotations?`, 'Delete article');
   if(!ok) return;
   index = index.filter(x=>x.id!==id);
-  await saveIndex(); await sDel('lilysnotes:article:'+id);
+  await saveIndex(); await sDel('lilysnotes:article:'+id); await idbDeletePdf(id);
   renderLibrary(); toast('Article deleted');
 }
 
@@ -760,22 +814,6 @@ async function extractPdfForStorage(file){
   return {paras, pdfBytes: buf};
 }
 
-function arrayBufferToBase64(buf){
-  let binary = '';
-  const bytes = new Uint8Array(buf);
-  const chunk = 0x8000;
-  for(let i=0; i<bytes.length; i+=chunk){
-    binary += String.fromCharCode.apply(null, bytes.subarray(i, i+chunk));
-  }
-  return btoa(binary);
-}
-function base64ToUint8Array(b64){
-  const binary = atob(b64);
-  const bytes = new Uint8Array(binary.length);
-  for(let i=0; i<binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  return bytes;
-}
-
 function textToParas(text){
   // strip html if it looks like html
   if(/<\/?(p|div|html|body|h\d)[\s>]/i.test(text)){
@@ -820,12 +858,12 @@ async function saveNewArticle(){
 
   const id = uid();
   if(pdfBytes){
-    await sSet('lilysnotes:pdfbytes:'+id, arrayBufferToBase64(pdfBytes));
-    // storage can silently fail (e.g. quota) — verify it actually landed rather than
-    // permanently marking this a PDF we can never re-render, which would show a
-    // "can't find the original" warning every single time it's reopened
-    const stored = await sGet('lilysnotes:pdfbytes:'+id);
-    if(!stored) kind = 'text';
+    // stored in IndexedDB (not localStorage) — see idbSetPdf for why.
+    // Verify it actually landed rather than permanently marking this a PDF we
+    // can never re-render, which would show a "can't find the original"
+    // warning every single time it's reopened.
+    const ok = await idbSetPdf(id, pdfBytes);
+    if(!ok) kind = 'text';
   }
   const meta = {id, title, source, tags, folderId, kind, added:Date.now(), status:'to read', hlCount:0, noteCount:0, progress:0};
   index.push(meta);
@@ -846,9 +884,9 @@ async function openArticle(id){
   current = {meta, ...data, pdfDoc:null};
   if(meta.kind==='pdf'){
     try{
-      const b64 = await sGet('lilysnotes:pdfbytes:'+id);
-      if(b64){
-        current.pdfDoc = await pdfjsLib.getDocument({data: base64ToUint8Array(b64)}).promise;
+      const buf = await idbGetPdf(id);
+      if(buf){
+        current.pdfDoc = await pdfjsLib.getDocument({data: new Uint8Array(buf)}).promise;
       } else {
         // no bytes ever landed for this one — stop treating it as a PDF so this
         // warning doesn't repeat on every future open of the same article
