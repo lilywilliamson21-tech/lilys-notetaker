@@ -819,10 +819,17 @@ async function saveNewArticle(){
   if(!paras.length){ toast('No readable text found in that file'); btn.textContent='Save to desk'; btn.disabled=false; return; }
 
   const id = uid();
+  if(pdfBytes){
+    await sSet('lilysnotes:pdfbytes:'+id, arrayBufferToBase64(pdfBytes));
+    // storage can silently fail (e.g. quota) — verify it actually landed rather than
+    // permanently marking this a PDF we can never re-render, which would show a
+    // "can't find the original" warning every single time it's reopened
+    const stored = await sGet('lilysnotes:pdfbytes:'+id);
+    if(!stored) kind = 'text';
+  }
   const meta = {id, title, source, tags, folderId, kind, added:Date.now(), status:'to read', hlCount:0, noteCount:0, progress:0};
   index.push(meta);
   await sSet('lilysnotes:article:'+id, {paras, highlights:[], notes:[]});
-  if(pdfBytes) await sSet('lilysnotes:pdfbytes:'+id, arrayBufferToBase64(pdfBytes));
   await saveIndex();
   document.getElementById('addScrim').remove();
   openArticle(id);
@@ -840,8 +847,14 @@ async function openArticle(id){
   if(meta.kind==='pdf'){
     try{
       const b64 = await sGet('lilysnotes:pdfbytes:'+id);
-      if(b64) current.pdfDoc = await pdfjsLib.getDocument({data: base64ToUint8Array(b64)}).promise;
-      else toast('Original PDF not found — showing extracted text instead');
+      if(b64){
+        current.pdfDoc = await pdfjsLib.getDocument({data: base64ToUint8Array(b64)}).promise;
+      } else {
+        // no bytes ever landed for this one — stop treating it as a PDF so this
+        // warning doesn't repeat on every future open of the same article
+        meta.kind = 'text'; await saveIndex();
+        toast('Original PDF not found — showing extracted text instead');
+      }
     }catch(err){
       console.error(err);
       toast('Could not re-open the original PDF — showing extracted text instead');
